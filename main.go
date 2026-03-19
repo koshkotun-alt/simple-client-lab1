@@ -1,71 +1,109 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "net/http"
-	"strconv" // добавляем этот импорт
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net/http"
 	"net/url"
+	"os"
 )
 
 // Структура для парсинга ответа Nominatim
 type Result struct {
-    Lat string `json:"lat"`
-    Lon string `json:"lon"`
-    DisplayName string `json:"display_name"`
+	DisplayName string `json:"display_name"`
+	Lat         string `json:"lat"`
+	Lon         string `json:"lon"`
 }
 
-func fetchCoordinates(city string) (float64, float64, error) {
-    escapedCity := url.QueryEscape(city)
-	url := fmt.Sprintf("https://nominatim.openstreetmap.org/search?q=%s&format=json&limit=1", escapedCity)
-    client := &http.Client{}
+func fetchCoordinates(address string, results chan<- Result, errs chan<- error) {
+	// Экранирование адреса
+	escapedAddress := url.QueryEscape(address)
+	apiURL := fmt.Sprintf("https://nominatim.openstreetmap.org/search?q=%s&format=json&limit=1", escapedAddress)
 
-    req, err := http.NewRequest("GET", url, nil)
-    if err != nil {
-        return 0, 0, err
-    }
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		errs <- err
+		return
+	}
 
-    // Указываем User-Agent или email для соблюдения правил
-	req.Header.Set("User-Agent", "МойГеокодер/1.0 (koshkotun@gmail.com)")
+	req.Header.Set("User-Agent", "GoGeoClient/1.0 (koshkotun@gmail.com)")
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return 0, 0, err
-    }
-    defer resp.Body.Close()
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		errs <- err
+		return
+	}
+	defer resp.Body.Close()
 
-    var results []Result
-    if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-        return 0, 0, err
-    }
+	var resultsSlice []Result
+	if err := json.NewDecoder(resp.Body).Decode(&resultsSlice); err != nil {
+		errs <- err
+		return
+	}
 
-    if len(results) == 0 {
-        return 0, 0, fmt.Errorf("Результаты не найдены")
-    }
+	if len(resultsSlice) == 0 {
+		errs <- fmt.Errorf("Нет результатов для адреса: %s", address)
+		return
+	}
 
-    lat, err := parseFloat(results[0].Lat)
-    if err != nil {
-        return 0, 0, err
-    }
-    lon, err := parseFloat(results[0].Lon)
-    if err != nil {
-        return 0, 0, err
-    }
-    return lat, lon, nil
-}
-
-func parseFloat(s string) (float64, error) {
-    return strconv.ParseFloat(s, 64)
+	results <- resultsSlice[0]
 }
 
 func main() {
-    city := "Москва"
+	// Обработка флагов
+	// Например, флаг вывода: --format=plain|json
+	formatFlag := flag.String("format", "json", "Формат вывода: json или plain")
+	flag.Parse()
 
-    lat, lon, err := fetchCoordinates(city)
-    if err != nil {
-        fmt.Println("Ошибка:", err)
-        return
-    }
+	addresses := flag.Args()
+	if len(addresses) == 0 {
+		fmt.Println("Пожалуйста, укажите хотя бы один адрес.")
+		os.Exit(1)
+	}
 
-    fmt.Printf("Координаты для %s:\nШирота: %f\nДолгота: %f\n", city, lat, lon)
+	// Каналы для результатов, ошибок и завершения
+	resultsCh := make(chan Result)
+	errorsCh := make(chan error)
+	doneCh := make(chan struct{})
+
+	// Запуск горутин для каждой адреса
+	for _, addr := range addresses {
+		go fetchCoordinates(addr, resultsCh, errorsCh)
+	}
+
+	// Координаты для вывода и счетчик
+	expected := len(addresses)
+	found := 0
+
+	// Обработка результатов и ошибок
+	go func() {
+		for {
+			select {
+			case res := <-resultsCh:
+				if *formatFlag == "json" {
+					data, _ := json.MarshalIndent(res, "", "  ")
+					fmt.Println(string(data))
+				} else { // plain
+					fmt.Printf("Адрес: %s\nШирота: %s\nДолгота: %s\n---\n", res.DisplayName, res.Lat, res.Lon)
+				}
+				found++
+				if found == expected {
+					close(doneCh)
+					return
+				}
+			case err := <-errorsCh:
+				fmt.Println("Ошибка:", err)
+				found++
+				if found == expected {
+					close(doneCh)
+					return
+				}
+			}
+		}
+	}()
+
+	// Ожидаем завершения
+	<-doneCh
 }
